@@ -20,6 +20,7 @@ from protocol import recv_message, send_message, encode_image
 from config import (CARLA_HOST, CARLA_PORT, RELAY_HOST, RELAY_PORT,
                     CAMERA_WIDTH, CAMERA_HEIGHT, JPEG_QUALITY, SYNC_MODE,
                     FIXED_DELTA_SECONDS, CAMERA_POS_X, CAMERA_POS_Z, CAMERA_FOV)
+from lane_extractor import extract_lanes
 
 
 # ==============================================================================
@@ -126,6 +127,43 @@ class VehicleClient:
 
         self.log(f"Spawned {self.player.type_id} at {self.player.get_location()}")
 
+        # Spawn multiple NPC vehicles so we have a populated scene
+        tm = self.carla_client.get_trafficmanager()
+        tm.set_synchronous_mode(True)
+        tm.set_global_distance_to_leading_vehicle(2.5)
+        self.tm_port = tm.get_port()
+        self._npc_vehicles = []
+
+        # Collect available spawn points that aren't occupied by ego
+        ego_loc = self.player.get_location()
+        npc_count = 0
+        npc_target = 15  # spawn ~15 NPC vehicles
+
+        vehicle_bps = bp_lib.filter('vehicle.*')
+        available_sps = []
+        for sp in spawn_points:
+            d = math.sqrt((sp.location.x - ego_loc.x)**2 + (sp.location.y - ego_loc.y)**2)
+            if d > 5.0:  # don't spawn on top of ego
+                available_sps.append(sp)
+        random.shuffle(available_sps)
+
+        for sp in available_sps[:npc_target]:
+            bp_npc = random.choice(vehicle_bps)
+            bp_npc.set_attribute('role_name', 'remote_npc')
+            if bp_npc.has_attribute('color'):
+                bp_npc.set_attribute('color',
+                    random.choice(bp_npc.get_attribute('color').recommended_values))
+            v = self.world.try_spawn_actor(bp_npc, sp)
+            if v is not None:
+                v.set_autopilot(True, self.tm_port)
+                self._npc_vehicles.append(v)
+                npc_count += 1
+
+        if npc_count > 0:
+            self.log(f"Spawned {npc_count} NPC vehicles with autopilot via TrafficManager")
+        else:
+            self.log("Could not spawn any NPC vehicles")
+
         # Spawn collision sensor
         self.collision_sensor = CollisionSensor(self.player)
 
@@ -171,10 +209,59 @@ class VehicleClient:
         self.log(f"Connecting to relay server at {RELAY_HOST}:{RELAY_PORT}...")
         self.relay_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.relay_sock.connect((RELAY_HOST, RELAY_PORT))
-        send_message(self.relay_sock, {'type': 'register', 'role': 'vehicle'})
-        self.log("Registered with relay server as vehicle")
+
+        # Extract lane data for BEV display
+        self.log("Extracting CARLA lane waypoints...")
+        t0 = time.time()
+        lane_data = extract_lanes(self.world, sample_distance=8.0, max_distance=200.0)
+        self.log(f"Lane extraction: {lane_data['num_lanes_summary']} "
+                 f"in {time.time() - t0:.1f}s")
+
+        register_msg = {
+            'type': 'register',
+            'role': 'vehicle',
+            'lane_data': lane_data,
+        }
+        send_message(self.relay_sock, register_msg)
+        self.log("Registered with relay server as vehicle (with lane data)")
 
     # -- Data Streaming --
+
+    def _get_surrounding_agents(self, max_range=100.0, max_agents=20):
+        """Query CARLA for surrounding vehicles within range.
+
+        Returns list of dicts with id, x, y, yaw_rad, vx, vy for each agent.
+        """
+        ego_loc = self.player.get_location()
+        ego_id = self.player.id
+        vehicles = self.world.get_actors().filter('vehicle.*')
+
+        agents = []
+        for v in vehicles:
+            if v.id == ego_id:
+                continue
+            vloc = v.get_location()
+            dx = vloc.x - ego_loc.x
+            dy = vloc.y - ego_loc.y
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist > max_range:
+                continue
+
+            vvel = v.get_velocity()
+            vrot = v.get_transform().rotation
+            agents.append({
+                'id': v.id,
+                'x': round(vloc.x, 2),
+                'y': round(vloc.y, 2),
+                'yaw_rad': round(math.radians(vrot.yaw), 4),
+                'vx': round(vvel.x, 2),
+                'vy': round(vvel.y, 2),
+                'dist': round(dist, 1),
+            })
+            if len(agents) >= max_agents:
+                break
+
+        return agents
 
     def _send_frame(self, frame_data):
         """Encode and send one camera frame + telemetry to relay."""
@@ -190,6 +277,9 @@ class VehicleClient:
 
         collision = self.collision_sensor.has_recent_collision(frame_data['frame_id'])
 
+        # Detect surrounding vehicles for multi-agent QCNet prediction
+        surrounding = self._get_surrounding_agents()
+
         msg = {
             'type': 'sensor_data',
             'timestamp': frame_data['timestamp'],
@@ -198,9 +288,11 @@ class VehicleClient:
             'image_width': CAMERA_WIDTH,
             'image_height': CAMERA_HEIGHT,
             'speed_kmh': round(speed_kmh, 1),
+            'velocity': [round(vel.x, 2), round(vel.y, 2), round(vel.z, 2)],
             'location': [round(loc.x, 2), round(loc.y, 2), round(loc.z, 2)],
             'rotation': [round(rot.yaw, 2), round(rot.pitch, 2), round(rot.roll, 2)],
             'collision': collision,
+            'surrounding': surrounding,
         }
 
         try:
@@ -253,6 +345,26 @@ class VehicleClient:
         control.manual_gear_shift = c['manual_gear_shift']
         self.player.apply_control(control)
 
+    def _enforce_speed_limit(self):
+        """Enforce 10 km/h speed cap smoothly on EVERY tick."""
+        MAX_SPEED_KMH = 10.0
+        limit_mps = MAX_SPEED_KMH / 3.6
+
+        vel = self.player.get_velocity()
+        speed_mps = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+        speed_kmh = speed_mps * 3.6
+
+        if speed_mps >= limit_mps:
+            # Smooth proportional throttle reduction: no hard brake.
+            # At 10.1 km/h → throttle *= 0.3, at 12+ km/h → throttle = 0.
+            overshoot = speed_kmh - MAX_SPEED_KMH
+            factor = max(0.0, 1.0 - overshoot * 0.4)
+            ctrl = self.player.get_control()
+            ctrl.throttle *= factor
+            if overshoot > 2.0:
+                ctrl.brake = max(ctrl.brake, 0.1)
+            self.player.apply_control(ctrl)
+
     def run(self):
         self.start_time = time.time()
         self.log("=== Vehicle Client Starting ===")
@@ -269,6 +381,7 @@ class VehicleClient:
             ctrl_thread.start()
 
             # Main loop: tick world, send latest frame, apply controls
+            # In synchronous mode, TM auto-advances with world.tick()
             self.log("Entering main loop...")
             while self.running:
                 if SYNC_MODE:
@@ -277,6 +390,11 @@ class VehicleClient:
                 # Apply received control before sending frame (so the frame
                 # reflects the most recent command)
                 self.apply_latest_control()
+
+                # ALSO enforce speed limit EVERY tick — not only when
+                # a new control arrives. This guarantees the vehicle never
+                # exceeds 10 km/h regardless of operator behavior.
+                self._enforce_speed_limit()
 
                 # Send new camera frame (only when frame_id changes)
                 with self.camera_lock:
@@ -304,6 +422,14 @@ class VehicleClient:
     def cleanup(self):
         self.log("Cleaning up...")
         self.running = False
+
+        # Destroy NPC vehicles (disable autopilot first)
+        for v in getattr(self, '_npc_vehicles', []):
+            try:
+                v.set_autopilot(False)
+                v.destroy()
+            except Exception:
+                pass
 
         if self.collision_sensor:
             self.collision_sensor.destroy()

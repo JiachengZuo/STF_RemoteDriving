@@ -29,7 +29,8 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from protocol import recv_message, send_message, decode_image
-from config import RELAY_HOST, RELAY_PORT, CAMERA_WIDTH, CAMERA_HEIGHT
+from config import RELAY_HOST, RELAY_PORT, CAMERA_WIDTH, CAMERA_HEIGHT, BEV_WIDTH, BEV_RANGE
+from bev_renderer import BEVRenderer
 
 
 # ==============================================================================
@@ -82,7 +83,7 @@ class HUD:
             f'Display FPS:  {self.display_fps:5.1f}',
             f'Frames recv:  {self.total_frames}',
             '',
-            f'Speed:    {self.speed_kmh:6.1f} km/h',
+            f'Speed:    {self.speed_kmh:6.1f} km/h  (max 10)',
             f'Location: ({self.location[0]:.1f}, {self.location[1]:.1f})',
             '',
             f'Throttle: {self.control["throttle"]:.2f}',
@@ -142,6 +143,10 @@ class OperatorClient:
         self.latest_image_bgr = None  # numpy array (H, W, 3)
         self.latest_surface = None    # pygame surface for display
         self.latest_telemetry = {}
+        self.latest_delay_ms = 0.0
+        self._smooth_delay_ms = 0.0  # EWMA-smoothed for stable BEV compensation
+        self.latest_qcnet_data = {}  # qcnet_trajs, qcnet_probs, qcnet_origin
+        self.lane_data = None        # lane centerlines + boundaries from relay
         self.total_frames = 0
         self.data_fps_tracker = []  # timestamps of recent frames
 
@@ -204,6 +209,11 @@ class OperatorClient:
         try:
             while self.running:
                 msg = recv_message(self.relay_sock)
+                if msg.get('type') == 'lane_data':
+                    with self.data_lock:
+                        self.lane_data = msg.get('lane_data')
+                    self.log(f"Received lane data: {msg.get('lane_data', {}).get('num_lanes_summary', '?')}")
+                    continue
                 if msg.get('type') != 'sensor_data':
                     continue
 
@@ -220,11 +230,45 @@ class OperatorClient:
                 img_rgb = img_bgr[:, :, ::-1]
                 surface = pygame.surfarray.make_surface(img_rgb.swapaxes(0, 1))
 
+                                # Compute round-trip delay from server timestamp
+                server_recv_time = msg.get('server_recv_time', 0)
+                if server_recv_time > 0:
+                    computed_delay_ms = (time.time() - server_recv_time) * 1000.0
+                else:
+                    computed_delay_ms = 0.0
+
+                                # Extract QCNet predictions
+                qcnet_data = {}
+                if 'qcnet_trajs' in msg:
+                    qcnet_data['trajs'] = msg['qcnet_trajs']
+                    qcnet_data['probs'] = msg['qcnet_probs']
+                    qcnet_data['origin'] = msg.get('qcnet_origin', [0, 0, 0])
+                    qcnet_data['agent_origins'] = msg.get('qcnet_agent_origins', None)
+                    qcnet_data['prediction_time'] = msg.get('qcnet_prediction_time', 0)
+
                 with self.data_lock:
                     self.latest_image_bgr = img_bgr
                     self.latest_surface = surface
                     self.latest_telemetry = msg
+                    # EWMA-smooth delay for stable BEV compensation.
+                    # Alpha=0.3: responsive enough to track real changes,
+                    # damped enough to avoid jitter from per-frame variance.
+                    raw_delay = computed_delay_ms
+                    if self._smooth_delay_ms == 0.0:
+                        smoothed = raw_delay  # snap on first reading
+                    else:
+                        alpha = 0.3
+                        smoothed = (1 - alpha) * self._smooth_delay_ms + alpha * raw_delay
+                    self._smooth_delay_ms = smoothed
+                    self.latest_delay_ms = smoothed
+                    if qcnet_data:
+                        self.latest_qcnet_data = qcnet_data
                     self.total_frames += 1
+                    if self.total_frames == 1 and qcnet_data:
+                        trajs_shape = f"shape {len(qcnet_data['trajs'])} agents"
+                        self.log(f"QCNet data received: {trajs_shape}, "
+                                 f"ego probs={[round(p,3) for p in qcnet_data['probs'][0]]}, "
+                                 f"origin={qcnet_data.get('origin')}")
                     self.data_fps_tracker.append(time.time())
                     # Keep last 60 entries
                     if len(self.data_fps_tracker) > 60:
@@ -238,7 +282,7 @@ class OperatorClient:
 
     def parse_keys(self, keys, milliseconds):
         """Parse keyboard state, update self.control. Adapted from manual_control.py."""
-        # Throttle
+        # Throttle (server-side hard limit at 10 km/h for QCNet accuracy)
         if keys[K_w] or keys[K_UP]:
             self.control['throttle'] = min(self.control['throttle'] + 0.1, 1.0)
         else:
@@ -311,14 +355,16 @@ Remote Driving Operator Controls:
         pygame.init()
         pygame.font.init()
 
-        display_w, display_h = CAMERA_WIDTH, CAMERA_HEIGHT
+        display_w, display_h = CAMERA_WIDTH + BEV_WIDTH, CAMERA_HEIGHT
         display = pygame.display.set_mode((display_w, display_h),
                                           pygame.HWSURFACE | pygame.DOUBLEBUF)
         pygame.display.set_caption('Remote Driving Operator')
         display.fill((0, 0, 0))
         pygame.display.flip()
 
-        self.hud = HUD(display_w, display_h)
+        self.hud = HUD(CAMERA_WIDTH, display_h)  # HUD only on camera side
+        self.bev_renderer = BEVRenderer(width=BEV_WIDTH, height=display_h,
+                                        world_range=BEV_RANGE)
         self.clock = pygame.time.Clock()
 
         try:
@@ -345,6 +391,8 @@ Remote Driving Operator Controls:
                 with self.data_lock:
                     surface = self.latest_surface
                     telemetry = self.latest_telemetry
+                    delay_ms = self.latest_delay_ms
+                    qcnet_data = dict(self.latest_qcnet_data)
 
                 if surface is not None:
                     display.blit(surface, (0, 0))
@@ -353,7 +401,7 @@ Remote Driving Operator Controls:
                     # Waiting text
                     font = pygame.font.Font(pygame.font.get_default_font(), 24)
                     wait_text = font.render('Waiting for video feed...', True, (255, 255, 255))
-                    display.blit(wait_text, (display_w // 2 - 100, display_h // 2))
+                    display.blit(wait_text, (CAMERA_WIDTH // 2 - 100, display_h // 2))
 
                 # Update HUD with telemetry
                 if telemetry:
@@ -363,6 +411,10 @@ Remote Driving Operator Controls:
                     self.hud.collision = telemetry.get('collision', False)
                     self.hud.control = dict(self.control)
                     self.hud.total_frames = self.total_frames
+                    self.hud.delay_ms = delay_ms
+
+                    # Feed trail to BEV renderer
+                    self.bev_renderer.add_trail_point(loc[0], loc[1])
 
                 # Compute data FPS
                 with self.data_lock:
@@ -372,6 +424,86 @@ Remote Driving Operator Controls:
                 self.hud.display_fps = self.clock.get_fps()
 
                 self.hud.render(display)
+
+                # --- BEV Panel (right side) ---
+                # Update lane data in BEV renderer when available
+                with self.data_lock:
+                    ld = self.lane_data
+                if ld is not None and self.bev_renderer.lane_data is None:
+                    self.bev_renderer.lane_data = ld
+                    self.log("BEV lane data loaded")
+
+                if telemetry and qcnet_data:
+                    loc = telemetry.get('location', [0, 0, 0])
+                    rot = telemetry.get('rotation', [0, 0, 0])
+                    origin = qcnet_data.get('origin', None)
+                    agent_origins = qcnet_data.get('agent_origins', None)
+                    pred_time = qcnet_data.get('prediction_time', 0)
+
+                    # Build surrounding_positions for BEV markers
+                    surrounding = telemetry.get('surrounding', [])
+                    surr_pos = [(a['x'], a['y'], a['yaw_rad']) for a in surrounding]
+
+                    # Continuous BEV delay compensation:
+                    #   elapsed_since_pred = time since QCNet ran (seconds)
+                    #   effective_delay = elapsed_since_pred + measured RTT delay
+                    #   step_idx = effective_delay / 50ms_per_step
+                    # This makes the BEV move smoothly along the predicted
+                    # trajectory every frame, rather than jumping only when
+                    # a new QCNet prediction arrives.
+                    if pred_time > 0:
+                        elapsed_since_pred = time.time() - pred_time
+                    else:
+                        elapsed_since_pred = 0
+
+                    # USE smoothed delay for BEV compensation (delay_ms
+                    # is already EWMA-smoothed from the data thread).
+                    # Add 50ms safety margin so BEV leads the camera slightly.
+                    # Total includes elapsed time since prediction (continuous
+                    # interpolation) + measured RTT delay.
+                    effective_delay_ms = (elapsed_since_pred * 1000.0) + delay_ms + 50.0
+
+                    bev_surface = self.bev_renderer.render(
+                        ego_x=loc[0],
+                        ego_y=loc[1],
+                        ego_yaw=math.radians(rot[0]),
+                        trajectories=qcnet_data.get('trajs'),
+                        probs=qcnet_data.get('probs'),
+                        origin=origin,
+                        agent_origins=agent_origins,
+                        surrounding_positions=surr_pos,
+                        delay_ms=effective_delay_ms,
+                    )
+                    display.blit(bev_surface, (CAMERA_WIDTH, 0))
+
+                    # Periodic BEV smoothness log (every ~5s at 60 FPS)
+                    if self.total_frames % 300 == 1:
+                        self.log(f"BEV: "
+                                 f"{len(qcnet_data.get('trajs', []))} agents, "
+                                 f"delay~{delay_ms:.0f}ms, "
+                                 f"pred_age~{max(0, elapsed_since_pred*1000):.0f}ms, "
+                                 f"eff_step~{effective_delay_ms/50:.1f}, "
+                                 f"disp_fps={self.hud.display_fps:.1f}")
+                else:
+                    # Dark placeholder
+                    bev_placeholder = pygame.Surface((BEV_WIDTH, display_h))
+                    bev_placeholder.fill((20, 22, 26))
+                    # QCNet status
+                    if qcnet_data:
+                        n_agents = len(qcnet_data.get('trajs', []))
+                        status = f'QCNet: {n_agents} agents'
+                    else:
+                        status = 'QCNet: warming up...'
+                    status_text = pygame.font.Font(
+                        pygame.font.get_default_font(), 13).render(
+                            status, True, (120, 120, 120))
+                    bev_placeholder.blit(status_text, (10, 10))
+                    display.blit(bev_placeholder, (CAMERA_WIDTH, 0))
+
+                # Separator line
+                pygame.draw.line(display, (80, 80, 80),
+                                 (CAMERA_WIDTH, 0), (CAMERA_WIDTH, display_h), 2)
+
                 pygame.display.flip()
 
         except KeyboardInterrupt:
